@@ -1,0 +1,134 @@
+
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Smart Room Control</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='styles.css') }}">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+</head>
+<body>
+<div class="app-container">
+  <header class="app-header">
+    <h1>Smart Room Dashboard</h1>
+    <p>Raspberry Pi - Sensors and Actuators</p>
+  </header>
+
+  <main class="grid">
+    <!-- Environment card -->
+    <section class="card">
+      <h2>Environment</h2>
+      <div class="gauges">
+        <div class="gauge">
+          <div class="gauge-label">Temperature</div>
+          <div class="gauge-bar">
+            <div id="temp-bar" class="gauge-fill"></div>
+          </div>
+          <div id="temp-text" class="gauge-value">-- deg C</div>
+        </div>
+        <div class="gauge">
+          <div class="gauge-label">Humidity</div>
+          <div class="gauge-bar">
+            <div id="hum-bar" class="gauge-fill"></div>
+          </div>
+          <div id="hum-text" class="gauge-value">-- %</div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Motion & Sound -->
+    <section class="card">
+      <h2>Presence and Sound</h2>
+      <div class="status-row">
+        <span>Motion</span>
+        <span id="motion-pill" class="pill pill-off">No motion</span>
+      </div>
+      <div class="status-row">
+        <span>Sound</span>
+        <span id="sound-pill" class="pill pill-off">Quiet</span>
+      </div>
+      <div class="status-row">
+        <span>Fire</span>
+        <span id="flame-pill" class="pill pill-off">Safe</span>
+      </div>
+      <div class="status-row">
+        <span>Safety Laser</span>
+        <span id="beam-pill" class="pill pill-off">Disabled</span>
+      </div>
+      <div class="status-row">
+        <span>Alarm</span>
+        <span id="alarm-pill" class="pill pill-off">Inactive</span>
+      </div>
+      <p class="hint">Double clap to toggle LED with buzzer feedback.</p>
+    </section>
+
+    <!-- Devices control -->
+    <section class="card">
+      <h2>Devices</h2>
+      <div class="button-row">
+        <button id="btn-led" class="btn">LED: --</button>
+        <button id="btn-laser" class="btn">Safety Laser: --</button>
+      </div>
+      <div class="button-row">
+        <button id="btn-stop-buzzer" class="btn btn-danger">Stop Buzzer</button>
+      </div>
+      <div class="button-row">
+        <button id="btn-open-window" class="btn">Open Window</button>
+        <button id="btn-close-window" class="btn">Close Window</button>
+      </div>
+      <p class="hint">High temperature triggers alarm and opens window automatically.</p>
+    </section>
+
+    <section class="card">
+      <h2>Modes</h2>
+      <div class="status-row">
+        <span>Clap toggles LED</span>
+        <label class="toggle">
+          <input id="sw-clap" class="toggle-input" type="checkbox" />
+          <span class="toggle-track">
+            <span class="toggle-label toggle-label-on">ON</span>
+            <span class="toggle-label toggle-label-off">OFF</span>
+            <span class="toggle-thumb"></span>
+          </span>
+        </label>
+      </div>
+      <div class="status-row">
+        <span>Any sound -> LED ON (5s)</span>
+        <label class="toggle">
+          <input id="sw-sound" class="toggle-input" type="checkbox" />
+          <span class="toggle-track">
+            <span class="toggle-label toggle-label-on">ON</span>
+            <span class="toggle-label toggle-label-off">OFF</span>
+            <span class="toggle-thumb"></span>
+          </span>
+        </label>
+      </div>
+      <div class="status-row">
+        <span>Motion -> LED ON (10s)</span>
+        <label class="toggle">
+          <input id="sw-motion" class="toggle-input" type="checkbox" />
+          <span class="toggle-track">
+            <span class="toggle-label toggle-label-on">ON</span>
+            <span class="toggle-label toggle-label-off">OFF</span>
+            <span class="toggle-thumb"></span>
+          </span>
+        </label>
+      </div>
+      <p class="hint">Clap toggle and sound mode cannot be active at the same time.</p>
+    </section>
+  </main>
+</div>
+
+<div id="fire-modal" class="modal-backdrop" aria-hidden="true">
+  <div class="modal">
+    <div class="modal-title">Fire detected</div>
+    <div class="modal-body">A flame was detected. The buzzer alarm will run for 30 seconds.</div>
+    <div class="modal-actions">
+      <button id="btn-fire-close" class="btn btn-danger">Close</button>
+    </div>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
