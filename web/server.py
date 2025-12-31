@@ -1,11 +1,16 @@
  # web/server.py
 import json
 import os
+import sys
 import threading
 from typing import Any, Dict, Optional
 
 import paho.mqtt.client as mqtt
 from flask import Flask, Response, jsonify, render_template, request
+
+_PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 try:
     from master_pi import config as master_config
@@ -19,6 +24,9 @@ _MQTT_PORT = int(os.getenv("SMARTHOME_MQTT_PORT", str(getattr(master_config, "MQ
 _MQTT_BASE_TOPIC = os.getenv(
     "SMARTHOME_MQTT_BASE_TOPIC", getattr(master_config, "MQTT_BASE_TOPIC", "smarthome")
 ).rstrip("/")
+
+_WEB_HOST = os.getenv("SMARTHOME_WEB_HOST", "0.0.0.0")
+_WEB_PORT = int(os.getenv("SMARTHOME_WEB_PORT", "5000"))
 
 _state_lock = threading.Lock()
 _latest_state: Dict[str, Any] = {}
@@ -49,11 +57,12 @@ def api_state():
         "laser_beam_ok": bool(s.get("laser_beam_ok", False)),
         "crossing_detected": bool(s.get("crossing_detected", False)),
         "safety_laser_enabled": bool(s.get("safety_laser_enabled", False)),
+        "door_closed": bool(s.get("door_closed", False)),
+        "door_locked": bool(s.get("door_locked", False)),
         "sound_detected": bool(s.get("sound_detected", False)),
         "led_on": bool(s.get("led_on", False)),
         "buzzer_on": bool(s.get("buzzer_on", False)),
         "laser_on": bool(s.get("laser_on", False)),
-        "window_open": bool(s.get("window_open", False)),
         "alarm_active": bool(s.get("alarm_active", False)),
         "clap_toggle_enabled": bool(s.get("clap_toggle_enabled", True)),
         "sound_led_mode_enabled": bool(s.get("sound_led_mode_enabled", False)),
@@ -90,11 +99,12 @@ def api_stream():
                 "laser_beam_ok": bool(payload.get("laser_beam_ok", False)),
                 "crossing_detected": bool(payload.get("crossing_detected", False)),
                 "safety_laser_enabled": bool(payload.get("safety_laser_enabled", False)),
+                "door_closed": bool(payload.get("door_closed", False)),
+                "door_locked": bool(payload.get("door_locked", False)),
                 "sound_detected": bool(payload.get("sound_detected", False)),
                 "led_on": bool(payload.get("led_on", False)),
                 "buzzer_on": bool(payload.get("buzzer_on", False)),
                 "laser_on": bool(payload.get("laser_on", False)),
-                "window_open": bool(payload.get("window_open", False)),
                 "alarm_active": bool(payload.get("alarm_active", False)),
                 "clap_toggle_enabled": bool(payload.get("clap_toggle_enabled", True)),
                 "sound_led_mode_enabled": bool(payload.get("sound_led_mode_enabled", False)),
@@ -187,25 +197,29 @@ def api_stop_buzzer():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/open_window", methods=["POST"])
-def api_open_window():
+@app.route("/api/lock_door", methods=["POST"])
+def api_lock_door():
     try:
         _ensure_mqtt_started()
-        _mqtt_publish_cmd("peripheral/window", {"action": "OPEN"})
-        return jsonify({"status": "opening"})
+        with _state_lock:
+            closed = bool(_latest_state.get("door_closed", False))
+        if not closed:
+            return jsonify({"error": "door_open"}), 409
+        _mqtt_publish_cmd("peripheral/door_lock", {"action": "LOCK"})
+        return jsonify({"status": "locking"})
     except Exception as e:
-        print("ERROR in /api/open_window:", e)
+        print("ERROR in /api/lock_door:", e)
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/close_window", methods=["POST"])
-def api_close_window():
+@app.route("/api/unlock_door", methods=["POST"])
+def api_unlock_door():
     try:
         _ensure_mqtt_started()
-        _mqtt_publish_cmd("peripheral/window", {"action": "CLOSE"})
-        return jsonify({"status": "closing"})
+        _mqtt_publish_cmd("peripheral/door_lock", {"action": "UNLOCK"})
+        return jsonify({"status": "unlocking"})
     except Exception as e:
-        print("ERROR in /api/close_window:", e)
+        print("ERROR in /api/unlock_door:", e)
         return jsonify({"error": str(e)}), 500
 
 
@@ -265,6 +279,64 @@ def _ensure_mqtt_started() -> None:
         _mqtt_started = True
 
 
+
+import base64
+
+_face_engine_import_error: Optional[str] = None
+
+try:
+    from master_pi.ai.face_engine import engine as face_engine
+except ImportError as e:
+    print(f"[WEB] Warning: Could not import face_engine. Face unlock will not work. Error: {e}")
+    face_engine = None
+    _face_engine_import_error = str(e)
+except Exception as e:
+    print(f"[WEB] Warning: Unexpected error importing face_engine: {e}")
+    face_engine = None
+    _face_engine_import_error = str(e)
+
+@app.route("/api/face_check", methods=["POST"])
+def api_face_check():
+    """
+    Receives a captured frame (base64 encoded JPEG), verifies identity,
+    and opens the door if authorized.
+    """
+    if face_engine is None:
+        detail = _face_engine_import_error or "Face engine not available"
+        return jsonify({"authorized": False, "error": "Face engine not available", "detail": detail}), 503
+
+    try:
+        body = request.get_json(silent=True) or {}
+        image_data = body.get("image") # format: "data:image/jpeg;base64,..."
+
+        if not image_data:
+            return jsonify({"authorized": False, "error": "No image data"}), 400
+
+        # Parse base64
+        if "," in image_data:
+            header, encoded = image_data.split(",", 1)
+        else:
+            encoded = image_data
+
+        image_bytes = base64.b64decode(encoded)
+
+        # Verify Face
+        authorized, name = face_engine.verify_face(image_bytes)
+
+        if authorized:
+            print(f"[WEB] Face authorized: {name}. Unlocking door.")
+            _ensure_mqtt_started()
+            _mqtt_publish_cmd("peripheral/door_lock", {"action": "UNLOCK"})
+            return jsonify({"authorized": True, "name": name})
+        
+        else:
+            print("[WEB] Face verification failed.")
+            return jsonify({"authorized": False, "error": "Access Denied"}), 200 # 200 OK but denied
+
+    except Exception as e:
+        print(f"[WEB] Error in /api/face_check: {e}")
+        return jsonify({"authorized": False, "error": str(e)}), 500
+
 if __name__ == "__main__":
     _ensure_mqtt_started()
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    app.run(host=_WEB_HOST, port=_WEB_PORT, debug=False)

@@ -9,7 +9,16 @@ async function apiPost(url, body = null) {
     opts.body = JSON.stringify(body);
   }
   const res = await fetch(url, opts);
-  return res.json();
+  let data = null;
+  try {
+    data = await res.json();
+  } catch (e) {
+    data = {};
+  }
+  if (!res.ok) {
+    return { ...data, _http_status: res.status };
+  }
+  return data;
 }
 
 let lastFlameDetected = false;
@@ -85,6 +94,7 @@ function renderState(data) {
   const soundPill = document.getElementById("sound-pill");
   const flamePill = document.getElementById("flame-pill");
   const beamPill = document.getElementById("beam-pill");
+  const doorPill = document.getElementById("door-pill");
   const alarmPill = document.getElementById("alarm-pill");
 
   updatePill(motionPill, data.motion, "Motion detected", "No motion");
@@ -101,6 +111,14 @@ function renderState(data) {
     }
   }
 
+  if (doorPill) {
+    if (data.door_closed) {
+      updatePill(doorPill, true, data.door_locked ? "Closed + Locked" : "Closed", "Open");
+    } else {
+      updatePill(doorPill, false, "Open", "Open", true);
+    }
+  }
+
   updatePill(alarmPill, data.alarm_active, "Alarm active", "Inactive", data.alarm_active);
 
   if (data.flame_detected) {
@@ -112,6 +130,8 @@ function renderState(data) {
   // Buttons
   const btnLed = document.getElementById("btn-led");
   const btnLaser = document.getElementById("btn-laser");
+
+  const btnLockDoor = document.getElementById("btn-lock-door");
 
   const swClap = document.getElementById("sw-clap");
   const swSound = document.getElementById("sw-sound");
@@ -131,6 +151,15 @@ function renderState(data) {
   } else {
     btnLaser.classList.remove("btn-active");
     btnLaser.textContent = "Safety Laser: OFF";
+  }
+
+  if (btnLockDoor) {
+    btnLockDoor.disabled = !data.door_closed || data.door_locked;
+    if (data.door_closed && !data.door_locked) {
+      btnLockDoor.classList.add("btn-active");
+    } else {
+      btnLockDoor.classList.remove("btn-active");
+    }
   }
 
   if (swClap) swClap.checked = !!data.clap_toggle_enabled;
@@ -217,9 +246,7 @@ async function fetchState() {
 function setupControls() {
   const btnLed = document.getElementById("btn-led");
   const btnLaser = document.getElementById("btn-laser");
-  const btnStopBuzzer = document.getElementById("btn-stop-buzzer");
-  const btnOpenWindow = document.getElementById("btn-open-window");
-  const btnCloseWindow = document.getElementById("btn-close-window");
+  const btnLockDoor = document.getElementById("btn-lock-door");
 
   const btnFireClose = document.getElementById("btn-fire-close");
   if (btnFireClose) {
@@ -242,18 +269,15 @@ function setupControls() {
     fetchState();
   });
 
-  btnStopBuzzer.addEventListener("click", async () => {
-    await apiPost("/api/stop_buzzer");
-    fetchState();
-  });
-
-  btnOpenWindow.addEventListener("click", async () => {
-    await apiPost("/api/open_window");
-  });
-
-  btnCloseWindow.addEventListener("click", async () => {
-    await apiPost("/api/close_window");
-  });
+  if (btnLockDoor) {
+    btnLockDoor.addEventListener("click", async () => {
+      const res = await apiPost("/api/lock_door");
+      if (res && res.error === "door_open") {
+        alert("Door is open, you can't lock it.");
+      }
+      fetchState();
+    });
+  }
 
   if (swClap) {
     swClap.addEventListener("change", async () => {
@@ -283,8 +307,81 @@ function setupControls() {
   }
 }
 
+
+function setupFaceUnlock() {
+  const video = document.getElementById('video-feed');
+  const canvas = document.getElementById('capture-canvas');
+  const btnUnlock = document.getElementById('btn-face-unlock');
+  const statusText = document.getElementById('face-status');
+
+  if (!video || !btnUnlock || !statusText) return;
+
+  if (!window.isSecureContext && window.location.hostname !== "localhost" && window.location.hostname !== "127.0.0.1") {
+    statusText.innerText = "Camera blocked: open this page on localhost or use HTTPS.";
+    statusText.style.color = "red";
+    return;
+  }
+
+  // Request Camera
+  if (navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+    statusText.innerText = "Starting camera...";
+    statusText.style.color = "#888";
+    navigator.mediaDevices.getUserMedia({ video: { width: 320, height: 240 } })
+      .then(stream => {
+        video.srcObject = stream;
+        return video.play();
+      })
+      .catch(err => {
+        console.error("Camera access denied:", err);
+        statusText.innerText = "Camera blocked/denied. Allow permission in the browser.";
+        statusText.style.color = "red";
+      });
+  } else {
+    statusText.innerText = "Camera API not supported";
+    statusText.style.color = "red";
+  }
+
+  btnUnlock.addEventListener('click', async () => {
+    if (!video.srcObject) {
+      statusText.innerText = "Camera not ready";
+      return;
+    }
+
+    // Capture frame
+    const context = canvas.getContext('2d');
+    context.drawImage(video, 0, 0, 320, 240);
+    const dataUrl = canvas.toDataURL('image/jpeg');
+    
+    statusText.innerText = "Verifying...";
+    statusText.style.color = "#888"; // reset color
+    
+    try {
+      const result = await apiPost('/api/face_check', { image: dataUrl });
+      
+      if (result.authorized) {
+        statusText.innerText = `Access GRANTED: ${result.name}`;
+        statusText.style.color = "green";
+      } else {
+        const extra = result && result._http_status === 503 && result.detail ? ` (${result.detail})` : "";
+        statusText.innerText = `Access DENIED: ${result.error || "Unknown"}${extra}`;
+        statusText.style.color = "red";
+      }
+    } catch (e) {
+      statusText.innerText = "Error connecting to server";
+      statusText.style.color = "red";
+    }
+    
+    // Reset status message after a few seconds
+    setTimeout(() => {
+        statusText.innerText = "Ready";
+        statusText.style.color = "#888";
+    }, 5000);
+  });
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   setupControls();
+  setupFaceUnlock();
   fetchState();
   const ok = startSseState();
   if (!ok) {

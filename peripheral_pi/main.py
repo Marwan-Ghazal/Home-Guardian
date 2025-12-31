@@ -8,9 +8,9 @@ from typing import Dict
 import RPi.GPIO as GPIO
 
 import config
-from devices import Laser, StepperWindow
+from devices import DoorLock, Laser
 from lcd import I2cLcd
-from sensors import Mcp3008, dht_loop, flame_loop, make_dht_reader, pir_loop
+from sensors import Mcp3008, dht_loop, flame_loop, hall_loop, make_dht_reader, pir_loop
 from system_state import state
 from uart_link import SerialLink
 
@@ -27,10 +27,10 @@ def main() -> None:
     GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
 
-    laser = Laser(config.LASER_PIN)
-    window = StepperWindow(config.STEPPER_PINS, config.STEPS_PER_REV, config.STEPPER_DELAY_SEC)
+    laser = Laser(config.LASER_PIN, active_low=config.LASER_ACTIVE_LOW)
+    door_lock = DoorLock(config.STEPPER_PINS, config.STEPS_PER_REV, config.STEPPER_DELAY_SEC)
     laser.setup()
-    window.setup()
+    door_lock.setup()
 
     lcd = I2cLcd(config.I2C_ADDR, width=config.LCD_WIDTH)
     lcd.init()
@@ -56,22 +56,34 @@ def main() -> None:
 
         if name == "LASER":
             on = bool(val)
-            laser.set(on)
+            print(f"[PERIPHERAL] CMD LASER on={on}")
+            try:
+                laser.set(on)
+            except Exception as e:
+                print(f"[PERIPHERAL] Laser.set failed (LASER cmd) on={on}: {e}")
             with state.lock:
                 state.laser_on = on
             return
 
         if name == "SAFETY_LASER":
             enabled = bool(val)
+            print(
+                f"[PERIPHERAL] CMD SAFETY_LASER enabled={enabled} pin={config.LASER_PIN} active_low={getattr(config, 'LASER_ACTIVE_LOW', False)}"
+            )
+            try:
+                laser.set(bool(enabled))
+            except Exception as e:
+                print(f"[PERIPHERAL] Laser.set failed (SAFETY_LASER cmd) enabled={enabled}: {e}")
             with state.lock:
                 state.safety_laser_enabled = enabled
+                state.laser_on = enabled
             return
 
-        if name == "WINDOW":
-            if val == "OPEN":
-                threading.Thread(target=_open_window, daemon=True).start()
-            elif val == "CLOSE":
-                threading.Thread(target=_close_window, daemon=True).start()
+        if name == "DOOR_LOCK":
+            if val == "LOCK":
+                threading.Thread(target=_lock_door, daemon=True).start()
+            elif val == "UNLOCK":
+                threading.Thread(target=_unlock_door, daemon=True).start()
             return
 
         if name == "ALARM":
@@ -87,15 +99,26 @@ def main() -> None:
     )
     link.start()
 
-    def _open_window() -> None:
-        window.open()
+    def _lock_door() -> None:
         with state.lock:
-            state.window_open = True
+            closed = bool(state.door_closed)
+        if not closed:
+            print("[DOOR] Refusing to lock: door is open")
+            return
+        if getattr(config, "DOOR_LOCK_INVERT", False):
+            door_lock.unlock()
+        else:
+            door_lock.lock()
+        with state.lock:
+            state.door_locked = True
 
-    def _close_window() -> None:
-        window.close()
+    def _unlock_door() -> None:
+        if getattr(config, "DOOR_LOCK_INVERT", False):
+            door_lock.lock()
+        else:
+            door_lock.unlock()
         with state.lock:
-            state.window_open = False
+            state.door_locked = False
 
     def set_motion(motion: bool) -> None:
         changed = False
@@ -110,6 +133,12 @@ def main() -> None:
         with state.lock:
             state.flame_detected = bool(flame)
 
+    def set_door_closed(closed: bool) -> None:
+        with state.lock:
+            state.door_closed = bool(closed)
+            if not state.door_closed:
+                state.door_locked = False
+
     def set_dht(t_c, h_pct) -> None:
         with state.lock:
             if t_c is not None:
@@ -122,6 +151,12 @@ def main() -> None:
     adc = Mcp3008(config.SPI_BUS, config.SPI_DEVICE, cs_pin=config.LDR_CS_PIN)
 
     threading.Thread(target=pir_loop, args=(config.PIR_PIN, set_motion), daemon=True).start()
+    threading.Thread(
+        target=hall_loop,
+        args=(config.HALL_PIN, set_door_closed),
+        kwargs={"active_low": config.HALL_ACTIVE_LOW, "poll_sec": config.HALL_POLL_SEC},
+        daemon=True,
+    ).start()
     threading.Thread(target=dht_loop, args=(config.DHT_SAMPLE_SEC, dht_read_once, set_dht), daemon=True).start()
     threading.Thread(
         target=flame_loop,
@@ -132,60 +167,86 @@ def main() -> None:
 
     def safety_laser_loop() -> None:
         baseline = None
+        last_beam_ok = False
         last_crossing = False
 
         while True:
-            with state.lock:
-                enabled = bool(state.safety_laser_enabled)
+            try:
+                with state.lock:
+                    enabled = bool(state.safety_laser_enabled)
 
-            if not enabled:
-                if baseline is not None:
-                    baseline = None
-                if last_crossing:
-                    last_crossing = False
+                if not enabled:
+                    if baseline is not None:
+                        baseline = None
+                    if last_beam_ok:
+                        last_beam_ok = False
+                    if last_crossing:
+                        last_crossing = False
+
+                    with state.lock:
+                        state.laser_beam_ok = False
+                        state.crossing_detected = False
+
+                    time.sleep(0.1)
+                    continue
+
+                # Keep forcing the emitter on while enabled.
+                with state.lock:
+                    if not state.laser_on:
+                        laser.set(True)
+                        state.laser_on = True
+
+                if baseline is None:
+                    # Calibration phase: don't report crossing yet.
+                    with state.lock:
+                        state.laser_beam_ok = False
+                        state.crossing_detected = False
+
+                    samples = []
+                    for _ in range(max(1, int(config.LDR_CALIB_SAMPLES))):
+                        samples.append(adc.read_channel(config.LDR_CHANNEL))
+                        time.sleep(max(0.001, float(config.LDR_POLL_SEC)))
+                    baseline = sum(samples) / max(1, len(samples))
+                    last_beam_ok = False
+
+                reading = adc.read_channel(config.LDR_CHANNEL)
+                # Hysteresis avoids flicker and prevents 'beam ok forever' due to
+                # a low threshold ratio.
+                ratio = float(config.LDR_THRESHOLD_RATIO)
+                hysteresis = 0.05
+
+                if config.LDR_BEAM_HIGH:
+                    thr_on = float(baseline) * ratio
+                    thr_off = float(baseline) * max(0.0, ratio - hysteresis)
+                    if last_beam_ok:
+                        beam_ok = reading >= thr_off
+                    else:
+                        beam_ok = reading >= thr_on
+                else:
+                    thr_on = float(baseline) * ratio
+                    thr_off = float(baseline) * (ratio + hysteresis)
+                    if last_beam_ok:
+                        beam_ok = reading <= thr_off
+                    else:
+                        beam_ok = reading <= thr_on
+
+                crossing = enabled and (not beam_ok)
+                if crossing != last_crossing:
+                    if crossing:
+                        print("[SECURITY] Someone is crossing (laser beam interrupted)")
+                    else:
+                        print("[SECURITY] Beam restored")
+                    last_crossing = crossing
+                last_beam_ok = bool(beam_ok)
 
                 with state.lock:
-                    if state.laser_on:
-                        laser.set(False)
-                        state.laser_on = False
-                    state.laser_beam_ok = False
-                    state.crossing_detected = False
+                    state.laser_beam_ok = bool(beam_ok)
+                    state.crossing_detected = bool(crossing)
 
-                time.sleep(0.1)
-                continue
-
-            with state.lock:
-                if not state.laser_on:
-                    laser.set(True)
-                    state.laser_on = True
-
-            if baseline is None:
-                samples = []
-                for _ in range(max(1, int(config.LDR_CALIB_SAMPLES))):
-                    samples.append(adc.read_channel(config.LDR_CHANNEL))
-                    time.sleep(max(0.001, float(config.LDR_POLL_SEC)))
-                baseline = sum(samples) / max(1, len(samples))
-
-            reading = adc.read_channel(config.LDR_CHANNEL)
-            thr = float(baseline) * float(config.LDR_THRESHOLD_RATIO)
-            if config.LDR_BEAM_HIGH:
-                beam_ok = reading >= thr
-            else:
-                beam_ok = reading <= thr
-
-            crossing = enabled and (not beam_ok)
-            if crossing != last_crossing:
-                if crossing:
-                    print("[SECURITY] Someone is crossing (laser beam interrupted)")
-                else:
-                    print("[SECURITY] Beam restored")
-                last_crossing = crossing
-
-            with state.lock:
-                state.laser_beam_ok = bool(beam_ok)
-                state.crossing_detected = bool(crossing)
-
-            time.sleep(max(0.01, float(config.LDR_POLL_SEC)))
+                time.sleep(max(0.01, float(config.LDR_POLL_SEC)))
+            except Exception as e:
+                print(f"[SECURITY] Safety laser loop error: {e}")
+                time.sleep(0.2)
 
     def lcd_loop() -> None:
         while True:
@@ -194,14 +255,14 @@ def main() -> None:
                 h = state.humidity_pct
                 occ = "Occ" if state.motion else "Emp"
                 led = "LON" if state.master_led_on else "LOF"
-                win = "WON" if state.window_open else "WOF"
+                dor = "DCL" if state.door_closed else "DOP"
                 las = "LAS" if state.laser_on else "---"
                 alarm = "ALRT" if state.alarm else ""
 
             t_str = f"T:{t:.1f}C" if t is not None else "T:--.-C"
             h_str = f"H:{h:.0f}%" if h is not None else "H:--%"
             lcd.write_line(f"{t_str} {h_str}", I2cLcd.LCD_LINE_1)
-            lcd.write_line(f"{occ} {led} {win} {las} {alarm}", I2cLcd.LCD_LINE_2)
+            lcd.write_line(f"{occ} {led} {dor} {las} {alarm}", I2cLcd.LCD_LINE_2)
             time.sleep(config.LCD_UPDATE_SEC)
 
     def state_tx_loop() -> None:
@@ -217,7 +278,8 @@ def main() -> None:
                     "flame_detected": state.flame_detected,
                     "laser_beam_ok": state.laser_beam_ok,
                     "crossing_detected": state.crossing_detected,
-                    "window_open": state.window_open,
+                    "door_closed": state.door_closed,
+                    "door_locked": state.door_locked,
                     "laser_on": state.laser_on,
                     "safety_laser_enabled": state.safety_laser_enabled,
                     "alarm": state.alarm,

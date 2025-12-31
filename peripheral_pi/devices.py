@@ -7,14 +7,19 @@ import RPi.GPIO as GPIO
 
 
 class Laser:
-    def __init__(self, pin: int):
+    def __init__(self, pin: int, *, active_low: bool = False):
         self._pin = pin
+        self._active_low = active_low
 
     def setup(self) -> None:
-        GPIO.setup(self._pin, GPIO.OUT, initial=GPIO.LOW)
+        initial = GPIO.HIGH if self._active_low else GPIO.LOW
+        GPIO.setup(self._pin, GPIO.OUT, initial=initial)
 
     def set(self, on: bool) -> None:
-        GPIO.output(self._pin, GPIO.HIGH if on else GPIO.LOW)
+        if self._active_low:
+            GPIO.output(self._pin, GPIO.LOW if on else GPIO.HIGH)
+        else:
+            GPIO.output(self._pin, GPIO.HIGH if on else GPIO.LOW)
 
 
 class StepperWindow:
@@ -54,3 +59,17 @@ class StepperWindow:
 
     def close(self) -> None:
         self._rotate(self._steps_per_rev, direction=0)
+
+
+class DoorLock:
+    def __init__(self, pins: List[int], steps_per_rev: int, delay_sec: float):
+        self._stepper = StepperWindow(pins, steps_per_rev, delay_sec)
+
+    def setup(self) -> None:
+        self._stepper.setup()
+
+    def lock(self) -> None:
+        self._stepper.close()
+
+    def unlock(self) -> None:
+        self._stepper.open()
